@@ -13,8 +13,12 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .timecore import (
+    CorrelationError,
+    CorrelationSet,
     TimeConversionError,
+    build_correlations,
     normalize_gps_event,
+    normalize_onboard_event,
     normalize_utc_event,
 )
 
@@ -23,7 +27,9 @@ MAX_EVENTS = 200
 MIN_EVENTS = 1
 
 GPS_FIELDS = ("gpsWeek", "gpsSecondsInWeek", "gpsNanoseconds")
-ALLOWED_FIELDS = {"id", "utc", *GPS_FIELDS}
+ONBOARD_FIELDS = ("clockPartition", "onboardTick")
+ALLOWED_FIELDS = {"id", "utc", *GPS_FIELDS, *ONBOARD_FIELDS}
+TOP_LEVEL_FIELDS = {"events", "correlations"}
 
 
 class RequestError(Exception):
@@ -35,6 +41,7 @@ class RequestError(Exception):
         status: int = 400,
         event_index: int | None = None,
         event_id: object | None = None,
+        correlation_index: int | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -42,6 +49,7 @@ class RequestError(Exception):
         self.status = status
         self.event_index = event_index
         self.event_id = event_id
+        self.correlation_index = correlation_index
 
 
 class _RejectFloat:
@@ -80,7 +88,23 @@ def _gps_int(value: object, field: str) -> int:
     )
 
 
-def _normalize_payload(raw: bytes) -> list[dict[str, object]]:
+def _tokens_to_int(value: object) -> object:
+    """Recursively turn JSON integer tokens into real ``int`` values.
+
+    Correlation segments are validated by the integer-only conversion
+    core; floats never reach this point because the JSON parser rejects
+    them, and quoted strings keep their (plain) ``str`` type.
+    """
+    if isinstance(value, _IntToken):
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _tokens_to_int(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_tokens_to_int(v) for v in value]
+    return value
+
+
+def _normalize_payload(raw: bytes) -> tuple[list[dict[str, object]], object]:
     try:
         payload = json.loads(
             raw,
@@ -103,12 +127,23 @@ def _normalize_payload(raw: bytes) -> list[dict[str, object]]:
             f"'events' must contain between {MIN_EVENTS} and {MAX_EVENTS}"
             f" items; got {len(events)}"
         )
-    if len(payload) != 1:
+    if "correlations" in payload:
+        unknown = set(payload) - TOP_LEVEL_FIELDS
+        if unknown:
+            raise RequestError(
+                "request body contains unknown top-level field(s):"
+                f" {', '.join(sorted(unknown))}"
+            )
+    elif len(payload) != 1:
+        # Legacy failure semantics: without 'correlations' the only
+        # permitted top-level field is 'events'.
         raise RequestError("request body may only contain the 'events' field")
-    return events
+    return events, payload.get("correlations")
 
 
-def _normalize_one(item: object, index: int) -> dict[str, str]:
+def _normalize_one(
+    item: object, index: int, correlations: CorrelationSet | None,
+) -> dict[str, str]:
     if not isinstance(item, dict):
         raise RequestError(
             "each event must be a JSON object", event_index=index
@@ -136,16 +171,24 @@ def _normalize_one(item: object, index: int) -> dict[str, str]:
     has_utc = "utc" in item
     gps_present = [f for f in GPS_FIELDS if f in item]
     has_gps = bool(gps_present)
-    if has_utc and has_gps:
-        fail("event specifies both 'utc' and GPS fields; choose exactly one")
-    if not has_utc and not has_gps:
-        fail("event must contain either 'utc' or GPS fields"
-             " (gpsWeek, gpsSecondsInWeek[, gpsNanoseconds])")
+    onboard_present = [f for f in ONBOARD_FIELDS if f in item]
+    has_onboard = bool(onboard_present)
+    kinds = int(has_utc) + int(has_gps) + int(has_onboard)
+    if kinds > 1:
+        fail(
+            "event specifies more than one time kind; choose exactly one of"
+            " 'utc', GPS fields or onboard fields (clockPartition,"
+            " onboardTick)"
+        )
+    if kinds == 0:
+        fail("event must contain either 'utc', GPS fields"
+             " (gpsWeek, gpsSecondsInWeek[, gpsNanoseconds]) or onboard"
+             " fields (clockPartition, onboardTick)")
 
     try:
         if has_utc:
             result = normalize_utc_event(item["utc"])
-        else:
+        elif has_gps:
             if "gpsWeek" not in item:
                 fail("GPS event is missing 'gpsWeek'")
             if "gpsSecondsInWeek" not in item:
@@ -156,6 +199,25 @@ def _normalize_one(item: object, index: int) -> dict[str, str]:
             if "gpsNanoseconds" in item:
                 nanos = _gps_int(item["gpsNanoseconds"], "gpsNanoseconds")
             result = normalize_gps_event(week, sow, nanos)
+        else:
+            if correlations is None:
+                fail(
+                    "onboard event requires request-level 'correlations'"
+                    " segments; none were supplied"
+                )
+            if "clockPartition" not in item:
+                fail("onboard event is missing 'clockPartition'")
+            if "onboardTick" not in item:
+                fail("onboard event is missing 'onboardTick'")
+            tick = _gps_int(item["onboardTick"], "onboardTick")
+            partition = item["clockPartition"]
+            # _IntToken is a str subclass: a JSON number literal must not
+            # be accepted as a partition name.
+            if isinstance(partition, _IntToken) or not isinstance(
+                partition, str
+            ):
+                fail("clockPartition must be a JSON string")
+            result = normalize_onboard_event(correlations, partition, tick)
     except TimeConversionError as exc:
         fail(str(exc))
     except RequestError as exc:
@@ -167,7 +229,19 @@ def _normalize_one(item: object, index: int) -> dict[str, str]:
 
 
 def normalize_batch(raw: bytes) -> list[dict[str, str]]:
-    events = _normalize_payload(raw)
+    events, raw_correlations = _normalize_payload(raw)
+    # Correlations are parsed and fully validated (shape, anchors,
+    # per-partition contiguity and boundary agreement) before any event is
+    # converted; a segment error is reported with its zero-based index and
+    # never carries event results.
+    try:
+        correlations = build_correlations(_tokens_to_int(raw_correlations))
+    except CorrelationError as exc:
+        raise RequestError(
+            exc.message,
+            code="INVALID_CORRELATION",
+            correlation_index=exc.segment_index,
+        ) from None
     seen: set[str] = set()
     results: list[dict[str, str]] = []
     for index, item in enumerate(events):
@@ -190,7 +264,7 @@ def normalize_batch(raw: bytes) -> list[dict[str, str]]:
     # Nothing is returned until the whole batch validates, so no partial
     # results can ever leak out of an error response.
     for index, item in enumerate(events):
-        results.append(_normalize_one(item, index))
+        results.append(_normalize_one(item, index, correlations))
     return results
 
 
@@ -248,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 err["eventIndex"] = exc.event_index
             if exc.event_id is not None:
                 err["eventId"] = exc.event_id
+            if exc.correlation_index is not None:
+                err["correlationIndex"] = exc.correlation_index
             self._send_json(exc.status, {"error": err})
             return
         self._send_json(200, {"results": results})

@@ -26,6 +26,8 @@ of 2017-06-28T00:00:00Z, which is taken to be the end of the supported era.
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections.abc import Mapping
 from dataclasses import dataclass
 import re
 
@@ -445,6 +447,328 @@ def normalize_gps_event(
         + ns
         + GPS_TAI_OFFSET_NS
     )
+    _check_supported_era(tai_ns)
+    ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
+    return NormalizedEvent(
+        tai_ns=tai_ns,
+        utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
+        utc_minus_tai=utc_minus_tai,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Onboard-clock correlation segments
+# ---------------------------------------------------------------------------
+#
+# A segment maps a half-open interval of integer onboard counts of one
+# clock partition onto the TAI nanosecond axis.  Within a segment the
+# mapping is linear with an integer slope (nanosecondsNumerator /
+# nanosecondsDenominator ns per count, both strictly positive integers):
+#
+#     tai(count) = anchorTaiNs
+#                 + (count - anchorCount) * numerator // denominator
+#
+# The specification requires the result to be an *exact* integer number of
+# nanoseconds, so the remainder of that floor division must be zero for
+# every mapped count; equivalently the residue class of the anchor count
+# must be the only representable one and each event must belong to it.
+# Every operation below is integer arithmetic -- no floats anywhere.
+
+class CorrelationError(ValueError):
+    """Invalid correlation set; message is caller-safe.
+
+    ``segment_index`` is the zero-based position in the request-level
+    ``correlations`` array (``None`` for errors that span the whole set).
+    """
+
+    def __init__(self, message: str, segment_index: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.segment_index = segment_index
+
+
+@dataclass(frozen=True)
+class Segment:
+    clock_partition: str
+    range_start: int          # inclusive
+    range_end: int            # exclusive
+    anchor_count: int
+    anchor_tai_ns: int
+    nanos_num: int
+    nanos_den: int
+
+    def contains(self, count: int) -> bool:
+        return self.range_start <= count < self.range_end
+
+    def map_tick(self, count: int) -> int:
+        """TAI ns of *count*; raises when the result is not an integer ns."""
+        delta_num = (count - self.anchor_count) * self.nanos_num
+        q, rem = divmod(delta_num, self.nanos_den)
+        if rem:
+            raise CorrelationError(
+                "onboard count maps to a sub-nanosecond TAI instant:"
+                f" partition {self.clock_partition!r}, count {count} leaves"
+                f" residue {rem}/{self.nanos_den} of a nanosecond under"
+                f" {self.nanos_num}/{self.nanos_den} ns per count"
+            )
+        return self.anchor_tai_ns + q
+
+
+def _seg_int(value: object, field: str, index: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CorrelationError(
+            f"correlation segment {index} field {field!r} must be an integer",
+            index,
+        )
+    return value
+
+
+def _parse_segment(raw: object, index: int) -> Segment:
+    if not isinstance(raw, Mapping):
+        raise CorrelationError(
+            f"correlation segment {index} must be a JSON object", index
+        )
+    required = (
+        "clockPartition", "tickRangeStart", "tickRangeEnd", "anchorTick",
+        "nanosecondsNumerator", "nanosecondsDenominator",
+    )
+    missing = [f for f in required if f not in raw]
+    if missing:
+        raise CorrelationError(
+            f"correlation segment {index} is missing required field(s):"
+            f" {', '.join(missing)}",
+            index,
+        )
+    allowed = {
+        *required, "anchorUtc", "anchorGpsWeek", "anchorGpsSecondsInWeek",
+        "anchorGpsNanoseconds",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise CorrelationError(
+            f"correlation segment {index} has unknown field(s):"
+            f" {', '.join(unknown)}",
+            index,
+        )
+
+    partition = raw["clockPartition"]
+    if not isinstance(partition, str) or not partition.strip():
+        raise CorrelationError(
+            f"correlation segment {index} field 'clockPartition' must be a"
+            " non-empty string",
+            index,
+        )
+    start = _seg_int(raw["tickRangeStart"], "tickRangeStart", index)
+    end = _seg_int(raw["tickRangeEnd"], "tickRangeEnd", index)
+    anchor = _seg_int(raw["anchorTick"], "anchorTick", index)
+    num = _seg_int(raw["nanosecondsNumerator"], "nanosecondsNumerator", index)
+    den = _seg_int(raw["nanosecondsDenominator"], "nanosecondsDenominator",
+                   index)
+    if end <= start:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) has an"
+            f" empty or inverted half-open tick range: [{start}, {end});"
+            " tickRangeEnd must be strictly greater than tickRangeStart",
+            index,
+        )
+    if not start <= anchor < end:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) has an"
+            " out-of-range anchor tick: anchorTick"
+            f" {anchor} is not in [{start}, {end})",
+            index,
+        )
+    if num <= 0:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) requires a"
+            f" strictly positive nanosecondsNumerator (got {num})",
+            index,
+        )
+    if den <= 0:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) requires a"
+            f" strictly positive nanosecondsDenominator (got {den})",
+            index,
+        )
+
+    has_utc = "anchorUtc" in raw
+    gps_fields = (
+        "anchorGpsWeek", "anchorGpsSecondsInWeek", "anchorGpsNanoseconds",
+    )
+    gps_present = [f for f in gps_fields if f in raw]
+    if has_utc and gps_present:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) gives both"
+            " 'anchorUtc' and GPS anchor fields; choose exactly one",
+            index,
+        )
+    if not has_utc and not gps_present:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) must give"
+            " an anchor either as 'anchorUtc' or as GPS fields"
+            " ('anchorGpsWeek' and 'anchorGpsSecondsInWeek', optionally"
+            " 'anchorGpsNanoseconds')",
+            index,
+        )
+    try:
+        if has_utc:
+            anchor_event = normalize_utc_event(raw["anchorUtc"])
+        else:
+            if "anchorGpsWeek" not in raw:
+                raise CorrelationError(
+                    f"correlation segment {index} (partition {partition!r})"
+                    " GPS anchor is missing 'anchorGpsWeek'", index
+                )
+            if "anchorGpsSecondsInWeek" not in raw:
+                raise CorrelationError(
+                    f"correlation segment {index} (partition {partition!r})"
+                    " GPS anchor is missing 'anchorGpsSecondsInWeek'", index
+                )
+            week = _seg_int(raw["anchorGpsWeek"], "anchorGpsWeek", index)
+            sow = _seg_int(raw["anchorGpsSecondsInWeek"],
+                           "anchorGpsSecondsInWeek", index)
+            nanos = 0
+            if "anchorGpsNanoseconds" in raw:
+                nanos = _seg_int(raw["anchorGpsNanoseconds"],
+                                 "anchorGpsNanoseconds", index)
+            anchor_event = normalize_gps_event(week, sow, nanos)
+    except TimeConversionError as exc:
+        raise CorrelationError(
+            f"correlation segment {index} (partition {partition!r}) has an"
+            f" invalid anchor: {exc}",
+            index,
+        ) from None
+
+    return Segment(
+        clock_partition=partition,
+        range_start=start,
+        range_end=end,
+        anchor_count=anchor,
+        anchor_tai_ns=anchor_event.tai_ns,
+        nanos_num=num,
+        nanos_den=den,
+    )
+
+
+@dataclass(frozen=True)
+class CorrelationSet:
+    """Validated segments plus O(log n) per-partition lookup."""
+
+    segments: tuple[Segment, ...]
+    _by_partition: Mapping[str, tuple[tuple[int, ...], tuple[Segment, ...]]]
+
+    def resolve(self, partition: str, count: int) -> Segment:
+        """Return the unique segment of *partition* covering *count*."""
+        table = self._by_partition.get(partition)
+        if table is None:
+            raise CorrelationError(
+                f"no correlation segment covers partition {partition!r}"
+            )
+        starts, segs = table
+        pos = bisect_right(starts, count) - 1
+        if pos < 0 or not segs[pos].contains(count):
+            raise CorrelationError(
+                f"onboard tick {count} of partition {partition!r} is not"
+                " covered by any correlation segment half-open tick range"
+            )
+        return segs[pos]
+
+
+def _build_correlation_set(segments: tuple[Segment, ...]) -> CorrelationSet:
+    grouped: dict[str, list[Segment]] = {}
+    order: dict[str, list[int]] = {}
+    for i, seg in enumerate(segments):
+        grouped.setdefault(seg.clock_partition, []).append(seg)
+        order.setdefault(seg.clock_partition, []).append(i)
+
+    tables: dict[str, tuple[tuple[int, ...], tuple[Segment, ...]]] = {}
+    for partition, segs in grouped.items():
+        # Order by range start; report problems at the later segment in
+        # request order so the index is unambiguous.
+        indexed = sorted(
+            zip(order[partition], segs), key=lambda pair: pair[1].range_start
+        )
+        for k in range(1, len(indexed)):
+            prev_idx, prev = indexed[k - 1]
+            idx, seg = indexed[k]
+            at = max(idx, prev_idx)
+            if seg.range_start < prev.range_end:
+                raise CorrelationError(
+                    f"correlation segments {prev_idx} and {idx} of partition"
+                    f" {partition!r} overlap: [{prev.range_start},"
+                    f" {prev.range_end}) and [{seg.range_start},"
+                    f" {seg.range_end}) share onboard ticks",
+                    at,
+                )
+            if seg.range_start > prev.range_end:
+                raise CorrelationError(
+                    f"correlation segments {prev_idx} and {idx} of partition"
+                    f" {partition!r} are not contiguous: a coverage gap exists"
+                    f" between {prev.range_end} and {seg.range_start}"
+                    " (touching segments must share their common boundary)",
+                    at,
+                )
+            # Same-partition segments touch at the common boundary tick.
+            # Both linear maps must place that tick at the same TAI instant.
+            try:
+                prev_edge = prev.map_tick(seg.range_start)
+                edge = seg.map_tick(seg.range_start)
+            except CorrelationError as exc:
+                raise CorrelationError(exc.message, at) from None
+            if prev_edge != edge:
+                raise CorrelationError(
+                    f"correlation segments {prev_idx} and {idx} of partition"
+                    f" {partition!r} disagree at their common boundary tick"
+                    f" {seg.range_start}: the earlier segment maps it to TAI"
+                    f" ns {prev_edge} but the later segment to TAI ns"
+                    f" {edge}",
+                    at,
+                )
+        tables[partition] = (
+            tuple(s.range_start for _, s in indexed),
+            tuple(s for _, s in indexed),
+        )
+    return CorrelationSet(segments=segments, _by_partition=tables)
+
+
+def build_correlations(raw: object) -> CorrelationSet | None:
+    """Parse and validate the optional request-level ``correlations``.
+
+    Returns ``None`` when the field is absent so that legacy requests keep
+    their exact previous semantics.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise CorrelationError("'correlations' must be an array")
+    if not (1 <= len(raw) <= 32):
+        raise CorrelationError(
+            f"'correlations' must contain between 1 and 32 segments; got"
+            f" {len(raw)}"
+        )
+    segments = tuple(_parse_segment(item, i) for i, item in enumerate(raw))
+    return _build_correlation_set(segments)
+
+
+def normalize_onboard_event(
+    correlations: CorrelationSet, partition: object, tick: object,
+) -> NormalizedEvent:
+    if not isinstance(partition, str) or not partition.strip():
+        raise TimeConversionError(
+            "clockPartition must be a non-empty string naming a correlation"
+            " partition"
+        )
+    if isinstance(tick, bool) or not isinstance(tick, int):
+        raise TimeConversionError("onboardTick must be an integer")
+    try:
+        segment = correlations.resolve(partition, tick)
+        tai_ns = segment.map_tick(tick)
+    except CorrelationError as exc:
+        # Coverage/sub-nanosecond failures are attributed to the event; the
+        # message itself names the partition and offending tick.
+        raise TimeConversionError(exc.message) from None
+    # The mapped instant must lie on the same supported TAI era as the
+    # GPS/UTC events, so the three streams mix without out-of-table labels.
     _check_supported_era(tai_ns)
     ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
     return NormalizedEvent(

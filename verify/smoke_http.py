@@ -182,6 +182,170 @@ def main() -> int:
           in body["error"].get("message", ""),
           "floating-point JSON number rejected")
 
+    print("[smoke] onboard-clock correlation segments spanning a segment"
+          " boundary")
+    # Two touching segments of partition 'A', both with 1 ms per tick but
+    # expressed with different numerator/denominator pairs, anchored at
+    # 2017-01-01T00:00:00Z and ...00.1Z respectively.  Partition 'B' is an
+    # independent 1-ns-per-tick clock anchored via GPS (1930:18 == the same
+    # UTC midnight).  The batch mixes UTC, GPS and onboard events.
+    status, body = post({
+        "correlations": [
+            {"clockPartition": "A", "tickRangeStart": 0,
+             "tickRangeEnd": 100, "anchorTick": 0,
+             "anchorUtc": "2017-01-01T00:00:00Z",
+             "nanosecondsNumerator": 1000000,
+             "nanosecondsDenominator": 1},
+            {"clockPartition": "A", "tickRangeStart": 100,
+             "tickRangeEnd": 200, "anchorTick": 100,
+             "anchorUtc": "2017-01-01T00:00:00.1Z",
+             "nanosecondsNumerator": 2000000,
+             "nanosecondsDenominator": 2},
+            {"clockPartition": "B", "tickRangeStart": 0,
+             "tickRangeEnd": 1000, "anchorTick": 0,
+             "anchorGpsWeek": 1930, "anchorGpsSecondsInWeek": 18,
+             "nanosecondsNumerator": 1,
+             "nanosecondsDenominator": 1},
+        ],
+        "events": [
+            {"id": "midnight-utc", "utc": "2017-01-01T00:00:00Z"},
+            {"id": "a0", "clockPartition": "A", "onboardTick": 0},
+            {"id": "a99", "clockPartition": "A", "onboardTick": 99},
+            # The shared boundary tick must map to the same TAI instant
+            # through both segments.
+            {"id": "a-boundary", "clockPartition": "A",
+             "onboardTick": 100},
+            {"id": "a150", "clockPartition": "A", "onboardTick": 150},
+            {"id": "b7", "clockPartition": "B", "onboardTick": 7},
+            {"id": "midnight-gps", "gpsWeek": 1930,
+             "gpsSecondsInWeek": 18, "gpsNanoseconds": 0},
+        ],
+    })
+    check(status == 200, f"correlation batch status 200 (got {status})")
+    if status != 200:
+        print(json.dumps(body, indent=2))
+        return 1
+
+    results = body["results"]
+    check([r["id"] for r in results] == [
+        "midnight-utc", "a0", "a99", "a-boundary", "a150", "b7",
+        "midnight-gps",
+    ], "mixed UTC/GPS/onboard result order matches input order")
+    midnight = by_id(results, "midnight-utc")
+    a0 = by_id(results, "a0")
+    a99 = by_id(results, "a99")
+    ab = by_id(results, "a-boundary")
+    a150 = by_id(results, "a150")
+    b7 = by_id(results, "b7")
+    mgps = by_id(results, "midnight-gps")
+
+    check(
+        midnight["taiNanoseconds"] == a0["taiNanoseconds"]
+        == mgps["taiNanoseconds"] == "1483228837000000000",
+        "UTC anchor, partition-A tick 0 and GPS 1930:18 share one TAI"
+        " instant",
+    )
+    check(
+        a99["taiNanoseconds"] == "1483228837099000000"
+        and ab["taiNanoseconds"] == "1483228837100000000"
+        and a150["taiNanoseconds"] == "1483228837150000000",
+        "ticks 99/100/150 land at 99 ms / 100 ms / 150 ms on the TAI axis",
+    )
+    check(
+        ab["utc"] == "2017-01-01T00:00:00.1Z",
+        "the boundary tick renders through the canonical UTC label",
+    )
+    check(
+        int(b7["taiNanoseconds"]) - int(mgps["taiNanoseconds"]) == 7,
+        "independent partition B advances 1 ns per tick",
+    )
+    for r in results:
+        check(set(r) == {"id", "taiNanoseconds", "utc",
+                         "utcTaiOffsetSeconds"},
+              f"event {r['id']} carries exactly the three time fields")
+
+    print("[smoke] correlation-specific invalid batches fail wholesale")
+
+    def seg_a(start, end, anchor_tick, anchor_utc):
+        return {"clockPartition": "A", "tickRangeStart": start,
+                "tickRangeEnd": end, "anchorTick": anchor_tick,
+                "anchorUtc": anchor_utc,
+                "nanosecondsNumerator": 1000000,
+                "nanosecondsDenominator": 1}
+
+    status, body = post({
+        "correlations": [
+            seg_a(0, 100, 0, "2017-01-01T00:00:00Z"),
+            seg_a(99, 200, 99, "2017-01-01T00:00:00.099Z"),
+        ],
+        "events": [{"id": "x", "clockPartition": "A", "onboardTick": 5}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("code") == "INVALID_CORRELATION"
+          and err.get("correlationIndex") == 1,
+          "overlapping segments -> 400 pinpointing segment index 1")
+    check("results" not in body, "overlap error carries no results")
+
+    status, body = post({
+        "correlations": [
+            seg_a(0, 100, 0, "2017-01-01T00:00:00Z"),
+            seg_a(101, 200, 101, "2017-01-01T00:00:00.2Z"),
+        ],
+        "events": [{"id": "x", "clockPartition": "A", "onboardTick": 5}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("correlationIndex") == 1
+          and "gap" in err.get("message", ""),
+          "non-contiguous (gapped) segments -> 400 naming the gap")
+
+    status, body = post({
+        "correlations": [
+            seg_a(0, 100, 0, "2017-01-01T00:00:00Z"),
+            seg_a(100, 200, 100, "2017-01-01T00:00:01Z"),
+        ],
+        "events": [{"id": "x", "clockPartition": "A", "onboardTick": 5}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("correlationIndex") == 1
+          and "boundary" in err.get("message", ""),
+          "segments disagreeing at the common boundary -> 400")
+
+    status, body = post({
+        "correlations": [
+            seg_a(0, 100, 0, "2018-01-01T00:00:00Z"),
+        ],
+        "events": [{"id": "x", "clockPartition": "A", "onboardTick": 5}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("correlationIndex") == 0
+          and "2017-06-28" in err.get("message", ""),
+          "illegal segment anchor beyond table expiry -> 400 at segment 0")
+
+    status, body = post({
+        "correlations": [
+            {"clockPartition": "A", "tickRangeStart": 0,
+             "tickRangeEnd": 100, "anchorTick": 0,
+             "anchorUtc": "2017-01-01T00:00:00Z",
+             "nanosecondsNumerator": 1, "nanosecondsDenominator": 2},
+        ],
+        "events": [{"id": "odd", "clockPartition": "A",
+                    "onboardTick": 1}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "odd"
+          and err.get("eventIndex") == 0,
+          "sub-nanosecond onboard tick -> 400 pinpointing the event")
+
+    status, body = post({
+        "correlations": [seg_a(0, 100, 0, "2017-01-01T00:00:00Z")],
+        "events": [{"id": "uncovered", "clockPartition": "A",
+                    "onboardTick": 100}],
+    })
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "uncovered"
+          and "covered" in err.get("message", ""),
+          "tick outside every half-open range -> 400 pinpointing event")
+
     if failures:
         print(f"[smoke] {len(failures)} FAILURE(S)")
         return 1
