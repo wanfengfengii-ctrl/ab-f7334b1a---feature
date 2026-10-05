@@ -1,0 +1,49 @@
+# Deep-space TT&C time normalizer.
+#   API    : long-running HTTP service with a health check
+#   verify : one-shot job that waits for API health, runs the code tests,
+#            an image-build check and a cross-leap-second HTTP smoke,
+#            then exits with a 0/1 verdict.
+#
+# Host port is configurable:  HOST_PORT=9090 docker compose up --abort-on-container-exit --exit-code-from verify
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deep-space-time:latest
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      # Left side = host port (override with HOST_PORT), right = container.
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import os,urllib.request,sys; port=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 2s
+    restart: unless-stopped
+
+  verify:
+    image: deep-space-time:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python3", "-m", "verify.entrypoint"]
+    environment:
+      API_HOST: "api"
+      PORT: "8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      # Read-only build context so the one-shot job can statically check
+      # the Dockerfile and this compose file from inside the image.
+      - ./:/build-context:ro
+    restart: "no"
