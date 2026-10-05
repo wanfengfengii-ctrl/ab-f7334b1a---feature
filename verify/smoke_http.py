@@ -182,6 +182,117 @@ def main() -> int:
           in body["error"].get("message", ""),
           "floating-point JSON number rejected")
 
+    print("[smoke] onboard clock correlations across a segment boundary")
+    # Partition 7, two abutting segments meeting at tick 1_000_000:
+    #   seg 0: [0, 1_000_000),     anchor tick 0     = 2017-01-01T00:00:00Z,
+    #                               1000 ns/tick;
+    #   seg 1: [1_000_000, 2_000_000), anchor tick 1_000_000 anchored via GPS
+    #                               at 2017-01-01T00:00:01Z, scale written
+    #                               as 2000/2 ns per tick (still 1000).
+    # The boundary tick must map to the same TAI instant from both sides.
+    correlations = [
+        {
+            "clockPartition": 7, "tickStart": 0, "tickEnd": 1_000_000,
+            "anchorTick": 0,
+            "nanosecondsPerTickNumerator": 1000,
+            "nanosecondsPerTickDenominator": 1,
+            "utc": "2017-01-01T00:00:00Z",
+        },
+        {
+            "clockPartition": 7, "tickStart": 1_000_000,
+            "tickEnd": 2_000_000, "anchorTick": 1_000_000,
+            "nanosecondsPerTickNumerator": 2000,
+            "nanosecondsPerTickDenominator": 2,
+            "gpsWeek": 1930, "gpsSecondsInWeek": 19,
+        },
+    ]
+    status, body = post({
+        "correlations": correlations,
+        "events": [
+            {"id": "last-before", "clockPartition": 7,
+             "onboardTick": 999_999},
+            {"id": "boundary", "clockPartition": 7, "onboardTick": 1_000_000},
+            {"id": "first-after", "clockPartition": 7,
+             "onboardTick": 1_000_001},
+            # Same physical instants submitted as UTC/GPS must match.
+            {"id": "boundary-gps", "gpsWeek": 1930,
+             "gpsSecondsInWeek": 19, "gpsNanoseconds": 0},
+            {"id": "leap-utc-2", "utc": "2016-12-31T23:59:60Z"},
+        ],
+    })
+    check(status == 200, f"correlation batch status 200 (got {status})")
+    if status != 200:
+        print(json.dumps(body, indent=2))
+        return 1
+    results = body["results"]
+    check([r["id"] for r in results] == [
+        "last-before", "boundary", "first-after",
+        "boundary-gps", "leap-utc-2",
+    ], "correlation result order matches input order")
+    last_before, boundary, first_after, boundary_gps, leap_utc = (
+        by_id(results, k) for k in (
+            "last-before", "boundary", "first-after",
+            "boundary-gps", "leap-utc-2")
+    )
+    check(
+        boundary["taiNanoseconds"] == boundary_gps["taiNanoseconds"]
+        == "1483228838000000000",
+        "shared boundary tick maps to the GPS-anchored TAI instant",
+    )
+    check(
+        int(boundary["taiNanoseconds"])
+        - int(last_before["taiNanoseconds"]) == 1000
+        and int(first_after["taiNanoseconds"])
+        - int(boundary["taiNanoseconds"]) == 1000,
+        "1000 ns/tick scale holds on both sides of the segment boundary",
+    )
+    check(
+        boundary["utc"] == "2017-01-01T00:00:01Z"
+        and boundary["utcTaiOffsetSeconds"] == "-37"
+        and leap_utc["utcTaiOffsetSeconds"] == "-36",
+        "onboard instants interleave correctly with UTC/GPS events",
+    )
+
+    print("[smoke] invalid correlation batches fail wholesale")
+    bad = json.loads(json.dumps(correlations))
+    bad[1]["gpsSecondsInWeek"] = 20  # boundary would map to T0 + 2 s
+    status, body = post({"correlations": bad, "events": [
+        {"id": "t", "clockPartition": 7, "onboardTick": 0},
+    ]})
+    err = body.get("error", {})
+    check(status == 400, "boundary disagreement -> 400")
+    check(err.get("correlationIndex") == 0
+          and err.get("relatedCorrelationIndex") == 1,
+          "error locates both abutting correlations")
+    check("results" not in body, "no partial results on correlation error")
+
+    status, body = post({"correlations": correlations, "events": [
+        {"id": "uncovered", "clockPartition": 7, "onboardTick": 2_000_000},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "uncovered"
+          and err.get("eventIndex") == 0
+          and "not covered" in err.get("message", ""),
+          "tick outside every segment -> 400 located to the event")
+
+    # Sub-nanosecond rejection with a 1 ns / 2 ticks scale: an odd tick
+    # offset from the anchor leaves a half-nanosecond remainder.
+    half = [{
+        "clockPartition": 7, "tickStart": 0, "tickEnd": 1_000_000,
+        "anchorTick": 0,
+        "nanosecondsPerTickNumerator": 1,
+        "nanosecondsPerTickDenominator": 2,
+        "utc": "2017-01-01T00:00:00Z",
+    }]
+    status, body = post({"correlations": half, "events": [
+        {"id": "halftick", "clockPartition": 7, "onboardTick": 1},
+    ]})
+    err = body.get("error", {})
+    check(status == 400 and err.get("eventId") == "halftick"
+          and err.get("correlationIndex") == 0
+          and "nanosecond" in err.get("message", ""),
+          "sub-nanosecond mapping -> 400 located to event and correlation")
+
     if failures:
         print(f"[smoke] {len(failures)} FAILURE(S)")
         return 1

@@ -452,3 +452,67 @@ def normalize_gps_event(
         utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
         utc_minus_tai=utc_minus_tai,
     )
+
+
+# ---------------------------------------------------------------------------
+# Onboard clock correlation segments
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TickSegment:
+    """One half-open onboard-clock segment pinned to the TAI axis.
+
+    Covers ticks ``[start, end)`` of one clock partition and maps a tick
+    ``t`` to TAI nanoseconds as::
+
+        tai(t) = anchor_tai_ns + (t - anchor_tick) * ns_num / ns_den
+
+    where ``ns_num / ns_den`` is the positive rational nanoseconds-per-tick
+    scale of the segment.  Every value stays an integer: the result is only
+    defined when the division has no remainder (a sub-nanosecond mapping is
+    a caller error, never a truncation).
+    """
+
+    start: int
+    end: int
+    anchor_tick: int
+    anchor_tai_ns: int
+    ns_per_tick_num: int
+    ns_per_tick_den: int
+
+    def contains(self, tick: int) -> bool:
+        return self.start <= tick < self.end
+
+    def map_tick(self, tick: int) -> int:
+        """Map an onboard tick to exact integer TAI nanoseconds.
+
+        Raises TimeConversionError when the rational scale would leave a
+        sub-nanosecond remainder for this tick.
+        """
+        delta_ticks = tick - self.anchor_tick
+        # anchor_tai * den + delta * num, all divided by den -- integer only.
+        unscaled = (
+            self.anchor_tai_ns * self.ns_per_tick_den
+            + delta_ticks * self.ns_per_tick_num
+        )
+        scaled, remainder = divmod(unscaled, self.ns_per_tick_den)
+        if remainder:
+            raise TimeConversionError(
+                f"onboard tick {tick} does not map to an integer number of"
+                f" TAI nanoseconds with scale {self.ns_per_tick_num}/"
+                f"{self.ns_per_tick_den} ns per tick (sub-nanosecond"
+                f" remainder {remainder}/{self.ns_per_tick_den})"
+            )
+        return scaled
+
+
+def normalize_onboard_event(segment: TickSegment, tick: int) -> NormalizedEvent:
+    """Map an onboard tick through a validated segment and render it."""
+    tai_ns = segment.map_tick(tick)
+    _check_supported_era(tai_ns)
+    ry, rm, rd, rh, rmi, rs, rns, utc_minus_tai = tai_to_utc(tai_ns)
+    return NormalizedEvent(
+        tai_ns=tai_ns,
+        utc_canonical=_format_utc(ry, rm, rd, rh, rmi, rs, rns),
+        utc_minus_tai=utc_minus_tai,
+    )
